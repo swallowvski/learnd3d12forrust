@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use cgmath::{Vector2, Vector3};
+use cgmath::{Matrix, Matrix4, SquareMatrix, Vector2, Vector3};
 use image::{GenericImageView, ImageBuffer, Rgb, Rgba};
 use windows::{
     core::*,
@@ -331,17 +331,10 @@ fn main() -> Result<()> {
     let png_image = image::load_from_memory(bytes).unwrap();
     let rgba_texture = png_image.to_rgba8();
 
-    let dimensions = png_image.dimensions();
-    dbg!(png_image.width());
-    dbg!(png_image.height());
-    dbg!(rgba_texture.len());
-    println!("{:?}", dimensions);
-
     let row_pictch =
         std::mem::size_of::<u8>() * (rgba_texture.len() / rgba_texture.height() as usize);
 
-    let size = alignemented_size(row_pictch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
-    dbg!(size);
+    let size = alignmented_size(row_pictch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
 
     let mut new_image = vec![];
     for r in rgba_texture.rows() {
@@ -517,15 +510,59 @@ fn main() -> Result<()> {
     }
     fence_val += 1;
 
-    let texture_descriptor_heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+    let basic_descriptor_heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
         NodeMask: 0,
-        NumDescriptors: 1,
+        NumDescriptors: 2,
         Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
     };
 
-    let texture_descriptor_heap: ID3D12DescriptorHeap =
-        unsafe { device.CreateDescriptorHeap(&texture_descriptor_heap_desc) }.unwrap();
+    let basic_descriptor_heap: ID3D12DescriptorHeap =
+        unsafe { device.CreateDescriptorHeap(&basic_descriptor_heap_desc) }.unwrap();
+
+    let mut matrix = Matrix4::identity();
+
+    let const_heap_properties = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+        ..Default::default()
+    };
+    let const_resource_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: alignmented_size(std::mem::size_of_val(&matrix), 256) as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            ..Default::default()
+        },
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+
+    let mut const_buffer: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &const_heap_properties,
+            D3D12_HEAP_FLAG_NONE,
+            &const_resource_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut const_buffer,
+        )
+    }
+    .unwrap();
+    let const_buffer = const_buffer.unwrap();
+
+    unsafe {
+        let mut const_map = std::ptr::null_mut();
+        const_buffer.Map(0, None, Some(&mut const_map)).unwrap();
+        std::ptr::copy_nonoverlapping(matrix.as_mut_ptr(), const_map as *mut f32, 16);
+    }
 
     let shader_resource_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -538,16 +575,36 @@ fn main() -> Result<()> {
             },
         },
     };
+    let basic_heap_handle = unsafe { basic_descriptor_heap.GetCPUDescriptorHandleForHeapStart() };
 
     unsafe {
         device.CreateShaderResourceView(
             &texture_buffer,
             Some(&shader_resource_desc),
-            texture_descriptor_heap.GetCPUDescriptorHandleForHeapStart(),
+            basic_heap_handle,
         )
     };
 
-    let descriptor_range = D3D12_DESCRIPTOR_RANGE {
+    let basic_heap_handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: basic_heap_handle.ptr
+            + unsafe {
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize
+            },
+    };
+
+    let const_buffer_view_desc = unsafe {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: const_buffer.GetGPUVirtualAddress(),
+            SizeInBytes: const_buffer.GetDesc().Width as u32,
+        }
+    };
+
+    unsafe { device.CreateConstantBufferView(Some(&const_buffer_view_desc), basic_heap_handle) };
+
+    let mut descriptor_ranges = [D3D12_DESCRIPTOR_RANGE::default(); 2];
+
+    descriptor_ranges[0] = D3D12_DESCRIPTOR_RANGE {
         NumDescriptors: 1,
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         BaseShaderRegister: 0,
@@ -555,16 +612,35 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    descriptor_ranges[1] = D3D12_DESCRIPTOR_RANGE {
+        NumDescriptors: 1,
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+        BaseShaderRegister: 0,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+        ..Default::default()
+    };
+
     let root_parameter = D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
             DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: 1,
-                pDescriptorRanges: &descriptor_range,
+                NumDescriptorRanges: 2,
+                pDescriptorRanges: descriptor_ranges.as_ptr(),
             },
         },
     };
+
+    //root_parameters[1] = D3D12_ROOT_PARAMETER {
+    //    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+    //    ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+    //    Anonymous: D3D12_ROOT_PARAMETER_0 {
+    //        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+    //            NumDescriptorRanges: 1,
+    //            pDescriptorRanges: &descriptor_ranges[1],
+    //        },
+    //    },
+    //};
 
     let sampler_desc = D3D12_STATIC_SAMPLER_DESC {
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
@@ -577,14 +653,6 @@ fn main() -> Result<()> {
         ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
         ..Default::default()
-    };
-
-    unsafe {
-        device.CreateShaderResourceView(
-            &texture_buffer,
-            Some(&shader_resource_desc),
-            texture_descriptor_heap.GetCPUDescriptorHandleForHeapStart(),
-        )
     };
 
     let input_layout = [
@@ -707,6 +775,7 @@ fn main() -> Result<()> {
         right: WINDOW_WIDTH as i32,
         bottom: WINDOW_HEIGHT as i32,
     };
+
     loop {
         event_loop.run_return(|event, _, control_flow| {
             control_flow.set_poll();
@@ -753,16 +822,23 @@ fn main() -> Result<()> {
 
                     unsafe { command_list.SetGraphicsRootSignature(&root_signature) };
                     unsafe {
-                        let texture_descriptor_heaps: [Option<ID3D12DescriptorHeap>; 1] =
-                            [Some(texture_descriptor_heap.can_clone_into())];
-                        command_list.SetDescriptorHeaps(&texture_descriptor_heaps);
+                        let basic_descriptor_heaps: [Option<ID3D12DescriptorHeap>; 1] =
+                            [Some(basic_descriptor_heap.can_clone_into())];
+                        command_list.SetDescriptorHeaps(&basic_descriptor_heaps);
                     }
-                    unsafe {
-                        command_list.SetGraphicsRootDescriptorTable(
-                            0,
-                            texture_descriptor_heap.GetGPUDescriptorHandleForHeapStart(),
-                        )
-                    };
+                    let heap_handle =
+                        unsafe { basic_descriptor_heap.GetGPUDescriptorHandleForHeapStart() };
+                    unsafe { command_list.SetGraphicsRootDescriptorTable(0, heap_handle) };
+                    //let heap_handle = D3D12_GPU_DESCRIPTOR_HANDLE {
+                    //    ptr: heap_handle.ptr
+                    //        + unsafe {
+                    //            device.GetDescriptorHandleIncrementSize(
+                    //                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    //            )
+                    //        } as u64,
+                    //};
+                    //unsafe { command_list.SetGraphicsRootDescriptorTable(1, heap_handle) };
+
                     unsafe { command_list.RSSetViewports(&[view_port]) }
                     unsafe { command_list.RSSetScissorRects(&[scissor_rect]) }
                     unsafe {
@@ -857,7 +933,7 @@ struct TexRGBA {
     a: u8,
 }
 
-fn alignemented_size(size: usize, alignment: usize) -> usize {
+fn alignmented_size(size: usize, alignment: usize) -> usize {
     let alignment = alignment - 1;
     (size + alignment) & !alignment
 }
